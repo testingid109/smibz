@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -35,13 +36,35 @@ func connectDB() {
 		log.Fatal("DATABASE_URL environment variable is required")
 	}
 
-	pool, err := pgxpool.New(context.Background(), connString)
+	config, err := pgxpool.ParseConfig(connString)
 	if err != nil {
-		log.Fatalf("failed to connect to database: %v", err)
+		log.Fatalf("invalid DATABASE_URL: %v", err)
 	}
 
-	if err := pool.Ping(context.Background()); err != nil {
-		log.Fatalf("database ping failed: %v", err)
+	// Tuned for a small free-tier Postgres behind a service that can sleep
+	// and cold-start (Render free tier). Recycling connections proactively
+	// avoids handing out ones that went stale while the service was asleep.
+	config.MaxConns = 5
+	config.MinConns = 1
+	config.MaxConnLifetime = 30 * time.Minute
+	config.MaxConnIdleTime = 3 * time.Minute
+	config.HealthCheckPeriod = 1 * time.Minute
+
+	var pool *pgxpool.Pool
+	for attempt := 1; attempt <= 5; attempt++ {
+		pool, err = pgxpool.NewWithConfig(context.Background(), config)
+		if err == nil {
+			if pingErr := pool.Ping(context.Background()); pingErr == nil {
+				break
+			} else {
+				err = pingErr
+			}
+		}
+		log.Printf("database connection attempt %d failed: %v", attempt, err)
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+	if err != nil {
+		log.Fatalf("could not connect to database after retries: %v", err)
 	}
 
 	db = pool
@@ -62,13 +85,28 @@ func newID(prefix string) string {
 	return prefix + "_" + strings.ToLower(generateCode())
 }
 
-func roomExists(ctx context.Context, code string) bool {
+// queryExistsWithRetry runs an EXISTS query with a couple of quick retries
+// before giving up. This is what fixes the "sometimes 404" bug: previously,
+// a single failed query was silently treated as "doesn't exist" instead of
+// "couldn't check." Now a real DB error is reported as a 500, and a
+// transient blip (e.g. right after Render/Supabase wake from idle) gets a
+// couple of quick extra tries before we give up.
+func queryExistsWithRetry(ctx context.Context, query string, args ...interface{}) (bool, error) {
 	var exists bool
-	db.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM rooms WHERE code = $1)", code).Scan(&exists)
-	return exists
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		err = db.QueryRow(ctx, query, args...).Scan(&exists)
+		if err == nil {
+			return exists, nil
+		}
+		time.Sleep(time.Duration(attempt*150) * time.Millisecond)
+	}
+	return false, err
 }
 
-// ---------- JSON helpers ----------
+func roomExists(ctx context.Context, code string) (bool, error) {
+	return queryExistsWithRetry(ctx, "SELECT EXISTS(SELECT 1 FROM rooms WHERE code = $1)", code)
+}
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -80,7 +118,7 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-// ---------- DTOs (unchanged from before — Android depends on these shapes) ----------
+// ---------- DTOs ----------
 
 type createRoomRequest struct {
 	Question    string   `json:"question"`
@@ -154,6 +192,10 @@ type statusResponse struct {
 	Result            *resultDTO             `json:"result,omitempty"`
 }
 
+func toOptionDTOs(options []roomOptionDTO) []roomOptionDTO {
+	return options
+}
+
 // ---------- Handlers ----------
 
 func createRoomHandler(w http.ResponseWriter, r *http.Request) {
@@ -189,13 +231,22 @@ func createRoomHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := generateCode()
-	for roomExists(ctx, code) {
+	for {
+		exists, err := roomExists(ctx, code)
+		if err != nil {
+			log.Printf("room existence check failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "database error, please try again")
+			return
+		}
+		if !exists {
+			break
+		}
 		code = generateCode()
 	}
 
 	tx, err := db.Begin(ctx)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error")
+		writeError(w, http.StatusInternalServerError, "database error, please try again")
 		return
 	}
 	defer tx.Rollback(ctx)
@@ -205,7 +256,7 @@ func createRoomHandler(w http.ResponseWriter, r *http.Request) {
 		code, req.Question, req.Category,
 	); err != nil {
 		log.Printf("insert room failed: %v", err)
-		writeError(w, http.StatusInternalServerError, "database error")
+		writeError(w, http.StatusInternalServerError, "database error, please try again")
 		return
 	}
 
@@ -217,7 +268,7 @@ func createRoomHandler(w http.ResponseWriter, r *http.Request) {
 			optionID, code, text, i,
 		); err != nil {
 			log.Printf("insert option failed: %v", err)
-			writeError(w, http.StatusInternalServerError, "database error")
+			writeError(w, http.StatusInternalServerError, "database error, please try again")
 			return
 		}
 		optionDTOs = append(optionDTOs, roomOptionDTO{ID: optionID, Text: text})
@@ -229,12 +280,12 @@ func createRoomHandler(w http.ResponseWriter, r *http.Request) {
 		creatorID, code, creatorName,
 	); err != nil {
 		log.Printf("insert participant failed: %v", err)
-		writeError(w, http.StatusInternalServerError, "database error")
+		writeError(w, http.StatusInternalServerError, "database error, please try again")
 		return
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		writeError(w, http.StatusInternalServerError, "database error")
+		writeError(w, http.StatusInternalServerError, "database error, please try again")
 		return
 	}
 
@@ -258,7 +309,8 @@ func joinRoomHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "room not found")
 		return
 	} else if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error")
+		log.Printf("join lookup failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "database error, please try again")
 		return
 	}
 
@@ -280,7 +332,8 @@ func joinRoomHandler(w http.ResponseWriter, r *http.Request) {
 		"INSERT INTO participants (id, room_code, name, seq) VALUES ($1, $2, $3, $4)",
 		participantID, code, name, nextSeq,
 	); err != nil {
-		writeError(w, http.StatusInternalServerError, "database error")
+		log.Printf("insert participant failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "database error, please try again")
 		return
 	}
 
@@ -309,7 +362,13 @@ func voteHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	code := strings.ToUpper(strings.TrimSpace(r.PathValue("code")))
 
-	if !roomExists(ctx, code) {
+	exists, err := roomExists(ctx, code)
+	if err != nil {
+		log.Printf("room existence check failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "database error, please try again")
+		return
+	}
+	if !exists {
 		writeError(w, http.StatusNotFound, "room not found")
 		return
 	}
@@ -320,11 +379,15 @@ func voteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var participantExists bool
-	db.QueryRow(ctx,
+	participantExists, err := queryExistsWithRetry(ctx,
 		"SELECT EXISTS(SELECT 1 FROM participants WHERE id = $1 AND room_code = $2)",
 		req.ParticipantID, code,
-	).Scan(&participantExists)
+	)
+	if err != nil {
+		log.Printf("participant existence check failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "database error, please try again")
+		return
+	}
 	if !participantExists {
 		writeError(w, http.StatusNotFound, "participant not found in this room")
 		return
@@ -337,21 +400,26 @@ func voteHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		var optionValid bool
-		db.QueryRow(ctx,
+		optionValid, err := queryExistsWithRetry(ctx,
 			"SELECT EXISTS(SELECT 1 FROM options WHERE id = $1 AND room_code = $2)",
 			optionID, code,
-		).Scan(&optionValid)
+		)
+		if err != nil {
+			log.Printf("option validity check failed after retries: %v", err)
+			continue // skip this one option rather than failing the whole vote
+		}
 		if !optionValid {
 			continue
 		}
 
-		db.Exec(ctx, `
+		if _, err := db.Exec(ctx, `
 			INSERT INTO preferences (participant_id, option_id, level, updated_at)
 			VALUES ($1, $2, $3, now())
 			ON CONFLICT (participant_id, option_id)
 			DO UPDATE SET level = $3, updated_at = now()
-		`, req.ParticipantID, optionID, string(level))
+		`, req.ParticipantID, optionID, string(level)); err != nil {
+			log.Printf("insert preference failed: %v", err)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -371,7 +439,8 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "room not found")
 		return
 	} else if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error")
+		log.Printf("status lookup failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "database error, please try again")
 		return
 	}
 
@@ -407,18 +476,15 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if allVoted {
-		resp.Result = computeResult(ctx, code, options, total)
+		resp.Result = computeResult(ctx, options, total)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // ---------- Consensus engine ----------
-//
-// Same heuristic as before: score = want*3 + okay*1 - no*2 - never*100.
-// A single NEVER vetoes an option. Now reads from Postgres instead of memory.
 
-func computeResult(ctx context.Context, code string, options []roomOptionDTO, total int) *resultDTO {
+func computeResult(ctx context.Context, options []roomOptionDTO, total int) *resultDTO {
 	results := make([]optionResultDTO, 0, len(options))
 
 	for _, opt := range options {
