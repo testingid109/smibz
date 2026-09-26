@@ -10,7 +10,9 @@ if (!rawBaseUrl) {
 
 export const GO_API_BASE_URL = rawBaseUrl.replace(/\/$/, "");
 
-const REQUEST_TIMEOUT_MS = 10_000;
+// Matches the Android client: Render's free tier can take 30-50s to wake
+// from a cold start, and 10s was firing false failures during that window.
+const REQUEST_TIMEOUT_MS = 40_000;
 
 export async function goFetch(
   path: string,
