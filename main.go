@@ -755,32 +755,62 @@ func formatDistance(meters float64) string {
 }
 
 func fetchOverpassElements(query string) ([]overpassElement, error) {
-	client := &http.Client{Timeout: 25 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 
 	overpassURL := os.Getenv("OVERPASS_API_URL")
 	if overpassURL == "" {
 		overpassURL = "https://overpass.private.coffee/api/interpreter"
 	}
 
-	resp, err := client.PostForm(
-		overpassURL,
-		url.Values{"data": {query}},
-	)
+	form := url.Values{"data": {query}}
+	const maxAttempts = 3
 
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, err := http.NewRequest(http.MethodPost, overpassURL, strings.NewReader(form.Encode()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("User-Agent", "Smibz/1.0 (+https://smibz.com)")
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("overpass returned status %d", resp.StatusCode)
+		resp, err := client.Do(req)
+		if err != nil {
+			if attempt == maxAttempts {
+				return nil, err
+			}
+			wait := time.Duration(5*attempt) * time.Second
+			log.Printf("overpass request failed (attempt %d/%d): %v; retrying in %s", attempt, maxAttempts, err, wait)
+			time.Sleep(wait)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			var parsed overpassResponse
+			err := json.NewDecoder(resp.Body).Decode(&parsed)
+			resp.Body.Close()
+			if err != nil {
+				return nil, err
+			}
+			return parsed.Elements, nil
+		}
+
+		statusCode := resp.StatusCode
+		resp.Body.Close()
+
+		if (statusCode == http.StatusTooManyRequests || statusCode == http.StatusNotAcceptable) && attempt < maxAttempts {
+			wait := 30 * time.Second
+			if statusCode == http.StatusTooManyRequests {
+				wait = time.Duration(30*attempt) * time.Second
+			}
+			log.Printf("overpass returned status %d (attempt %d/%d); retrying in %s", statusCode, attempt, maxAttempts, wait)
+			time.Sleep(wait)
+			continue
+		}
+
+		return nil, fmt.Errorf("overpass returned status %d", statusCode)
 	}
 
-	var parsed overpassResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return nil, err
-	}
-	return parsed.Elements, nil
+	return nil, fmt.Errorf("overpass request failed after %d attempts", maxAttempts)
 }
 
 func elementsToPlaceDTOs(elements []overpassElement, originLat, originLng float64, category string) []explorePlaceDTO {
@@ -1119,7 +1149,12 @@ func ingestPlacesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, ingestResponse{
+	responseStatus := http.StatusOK
+	if len(errs) > 0 {
+		responseStatus = http.StatusBadGateway
+	}
+
+	writeJSON(w, responseStatus, ingestResponse{
 		AreasProcessed: len(areas),
 		PlacesUpserted: totalUpserted,
 		Errors:         errs,
