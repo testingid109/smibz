@@ -550,33 +550,31 @@ func computeResult(ctx context.Context, options []roomOptionDTO, total int) *res
 	return &resultDTO{MatchType: matchType, Options: results, TopOptionID: topOptionID}
 }
 
-// ==================== EXPLORE / NEARBY PLACES ====================
+// ==================== EXPLORE / NEARBY PLACES — PIPELINE 1 + 2 ====================
 //
-// Pipeline 1 (serving), scoped for where the product actually is today:
-//   - PostGIS  -> replaced with a live OpenStreetMap Overpass query.
-//     No pre-ingested spatial index yet; each request queries OSM
-//     directly. Fine at current traffic; revisit once Explore has
-//     real usage and OSM's live-query latency becomes the bottleneck.
-//   - Redis    -> replaced with an in-process, TTL'd map. Same role
-//     (avoid repeat upstream calls for the same area), no extra
-//     service to run yet.
-//   - Ranking  -> distance-based only for now. Real signals (group
-//     behavior, past Smibz selections, popularity) need usage data
-//     that doesn't exist until people actually use this feature.
+// Pipeline 2 (ingestion) now genuinely exists: a scheduled/admin-triggered
+// sweep pulls places from OpenStreetMap into a real PostGIS-backed table,
+// deduplicated by (source, external_id) via upsert. Pipeline 1 (serving)
+// now reads from that table first — fast, indexed, local — and only
+// falls back to a live OSM query for areas nobody has ingested yet,
+// lazily seeding the database with whatever it finds so that area is
+// covered from then on.
 //
-// Pipeline 2 (ingestion: entity resolution, dedup, enrichment, search
-// index) is deliberately NOT built here — it's real, valuable,
-// later-stage work once this MVP proves the feature is worth it.
+// Still deliberately NOT built: a separate search service (Postgres
+// full-text search covers this for free), a dedicated Redis (the
+// in-process cache still plays that role), and cross-source entity
+// resolution (only one source — OSM — so there's nothing to reconcile
+// yet; this becomes real work only once a second data source is added).
 
 type explorePlaceDTO struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	Category       string   `json:"category"`
-	Subcategory    string   `json:"subcategory"`
-	Latitude       float64  `json:"latitude"`
-	Longitude      float64  `json:"longitude"`
-	Address        string   `json:"address"`
-	DistanceMeters float64  `json:"distanceMeters"`
+	ID             string  `json:"id"`
+	Name           string  `json:"name"`
+	Category       string  `json:"category"`
+	Subcategory    string  `json:"subcategory"`
+	Latitude       float64 `json:"latitude"`
+	Longitude      float64 `json:"longitude"`
+	Address        string  `json:"address"`
+	DistanceMeters float64 `json:"distanceMeters"`
 	Rating         *float64 `json:"rating,omitempty"`
 	ReviewCount    int      `json:"reviewCount"`
 	PriceLevel     *int     `json:"priceLevel,omitempty"`
@@ -588,12 +586,12 @@ type explorePlaceDTO struct {
 }
 
 type nearbyPlacesResponse struct {
-	Latitude     float64            `json:"latitude"`
-	Longitude    float64            `json:"longitude"`
-	RadiusMeters int                `json:"radiusMeters"`
-	Category     string             `json:"category"`
-	Cached       bool               `json:"cached"`
-	Places       []explorePlaceDTO  `json:"places"`
+	Latitude     float64           `json:"latitude"`
+	Longitude    float64           `json:"longitude"`
+	RadiusMeters int               `json:"radiusMeters"`
+	Category     string            `json:"category"`
+	Cached       bool              `json:"cached"`
+	Places       []explorePlaceDTO `json:"places"`
 }
 
 type osmTagFilter struct {
@@ -601,41 +599,78 @@ type osmTagFilter struct {
 	Value string
 }
 
-var exploreCategoryTags = map[string][]osmTagFilter{
-	"eat": {
-		{"amenity", "restaurant"}, {"amenity", "cafe"},
-		{"amenity", "fast_food"}, {"amenity", "bar"}, {"amenity", "pub"},
-	},
-	"watch": {
-		{"amenity", "cinema"}, {"amenity", "theatre"},
-	},
-	"do": {
-		{"tourism", "attraction"}, {"leisure", "amusement_arcade"}, {"amenity", "cinema"},
-	},
-	"play": {
-		{"leisure", "sports_centre"}, {"leisure", "fitness_centre"},
-		{"leisure", "bowling_alley"}, {"leisure", "pitch"},
-	},
-	"travel": {
-		{"tourism", "hotel"}, {"tourism", "attraction"}, {"tourism", "museum"},
-	},
-	"buy": {
-		{"shop", "mall"}, {"shop", "supermarket"}, {"shop", "clothes"},
-	},
-	"chill": {
-		{"amenity", "cafe"}, {"leisure", "park"},
-	},
-	"events": {
-		{"amenity", "events_venue"}, {"amenity", "arts_centre"},
-	},
-	"outdoors": {
-		{"leisure", "park"}, {"leisure", "garden"}, {"natural", "beach"},
-	},
+type categoryTagSet struct {
+	Category string
+	Tags     []osmTagFilter
 }
 
-var defaultExploreTags = []osmTagFilter{
-	{"amenity", "restaurant"}, {"amenity", "cafe"}, {"amenity", "cinema"},
-	{"tourism", "attraction"}, {"leisure", "park"},
+// An ordered list, not a map: category assignment during ingestion
+// checks these in order, so overlapping tags resolve deterministically
+// (e.g. "cafe" always lands in "eat", never randomly in "chill").
+var exploreCategoryDefs = []categoryTagSet{
+	{"eat", []osmTagFilter{
+		{"amenity", "restaurant"}, {"amenity", "cafe"},
+		{"amenity", "fast_food"}, {"amenity", "bar"}, {"amenity", "pub"},
+	}},
+	{"watch", []osmTagFilter{
+		{"amenity", "cinema"}, {"amenity", "theatre"},
+	}},
+	{"play", []osmTagFilter{
+		{"leisure", "sports_centre"}, {"leisure", "fitness_centre"},
+		{"leisure", "bowling_alley"}, {"leisure", "pitch"},
+	}},
+	{"travel", []osmTagFilter{
+		{"tourism", "hotel"}, {"tourism", "museum"},
+	}},
+	{"buy", []osmTagFilter{
+		{"shop", "mall"}, {"shop", "supermarket"}, {"shop", "clothes"},
+	}},
+	{"events", []osmTagFilter{
+		{"amenity", "events_venue"}, {"amenity", "arts_centre"},
+	}},
+	{"outdoors", []osmTagFilter{
+		{"leisure", "garden"}, {"natural", "beach"},
+	}},
+	{"do", []osmTagFilter{
+		{"tourism", "attraction"}, {"leisure", "amusement_arcade"},
+	}},
+	{"chill", []osmTagFilter{
+		{"leisure", "park"},
+	}},
+}
+
+func tagsForCategory(category string) []osmTagFilter {
+	for _, def := range exploreCategoryDefs {
+		if def.Category == category {
+			return def.Tags
+		}
+	}
+	return nil
+}
+
+func allCategoryTags() []osmTagFilter {
+	seen := make(map[osmTagFilter]bool)
+	all := []osmTagFilter{}
+	for _, def := range exploreCategoryDefs {
+		for _, t := range def.Tags {
+			if !seen[t] {
+				seen[t] = true
+				all = append(all, t)
+			}
+		}
+	}
+	return all
+}
+
+func categorizeOSMTags(tags map[string]string) string {
+	for _, def := range exploreCategoryDefs {
+		for _, f := range def.Tags {
+			if tags[f.Key] == f.Value {
+				return def.Category
+			}
+		}
+	}
+	return "do"
 }
 
 type overpassElement struct {
@@ -662,12 +697,10 @@ var exploreCache = struct {
 
 const exploreCacheTTL = 10 * time.Minute
 
-func exploreCacheKey(lat, lng float64, radius int, category string) string {
-	// Rounding to 2 decimal places groups requests within roughly a
-	// 1.1km grid cell onto the same cache entry.
+func exploreCacheKey(lat, lng float64, radius int, category, searchQuery string) string {
 	roundedLat := math.Round(lat*100) / 100
 	roundedLng := math.Round(lng*100) / 100
-	return fmt.Sprintf("%.2f:%.2f:%d:%s", roundedLat, roundedLng, radius, category)
+	return fmt.Sprintf("%.2f:%.2f:%d:%s:%s", roundedLat, roundedLng, radius, category, searchQuery)
 }
 
 func haversineMeters(lat1, lon1, lat2, lon2 float64) float64 {
@@ -721,8 +754,8 @@ func formatDistance(meters float64) string {
 	return fmt.Sprintf("%.1f km away", meters/1000)
 }
 
-func fetchOverpassPlaces(query string, originLat, originLng float64, category string) ([]explorePlaceDTO, error) {
-	client := &http.Client{Timeout: 20 * time.Second}
+func fetchOverpassElements(query string) ([]overpassElement, error) {
+	client := &http.Client{Timeout: 25 * time.Second}
 
 	resp, err := client.PostForm("https://overpass-api.de/api/interpreter", url.Values{"data": {query}})
 	if err != nil {
@@ -738,12 +771,15 @@ func fetchOverpassPlaces(query string, originLat, originLng float64, category st
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 		return nil, err
 	}
+	return parsed.Elements, nil
+}
 
-	places := make([]explorePlaceDTO, 0, len(parsed.Elements))
-	for _, el := range parsed.Elements {
+func elementsToPlaceDTOs(elements []overpassElement, originLat, originLng float64, category string) []explorePlaceDTO {
+	places := make([]explorePlaceDTO, 0, len(elements))
+	for _, el := range elements {
 		name := el.Tags["name"]
 		if name == "" {
-			continue // unnamed OSM nodes aren't useful to show
+			continue
 		}
 
 		distance := haversineMeters(originLat, originLng, el.Lat, el.Lon)
@@ -762,10 +798,15 @@ func fetchOverpassPlaces(query string, originLat, originLng float64, category st
 		}
 		reason := formatDistance(distance)
 
+		resolvedCategory := category
+		if resolvedCategory == "" || resolvedCategory == "all" {
+			resolvedCategory = categorizeOSMTags(el.Tags)
+		}
+
 		places = append(places, explorePlaceDTO{
 			ID:             fmt.Sprintf("osm_%d", el.ID),
 			Name:           name,
-			Category:       category,
+			Category:       resolvedCategory,
 			Subcategory:    firstNonEmpty(el.Tags["amenity"], el.Tags["shop"], el.Tags["leisure"], el.Tags["tourism"]),
 			Latitude:       el.Lat,
 			Longitude:      el.Lon,
@@ -777,7 +818,96 @@ func fetchOverpassPlaces(query string, originLat, originLng float64, category st
 			Reason:         &reason,
 		})
 	}
+	return places
+}
 
+// upsertOSMElement is the shared write path for both the scheduled
+// ingestion sweep and the lazy fallback below. Dedup key is
+// (source, external_id) - re-ingesting the same OSM node updates it
+// in place rather than creating a duplicate row.
+func upsertOSMElement(ctx context.Context, el overpassElement) (bool, error) {
+	name := el.Tags["name"]
+	if name == "" {
+		return false, nil
+	}
+
+	category := categorizeOSMTags(el.Tags)
+	address := buildAddress(el.Tags)
+	subcategory := firstNonEmpty(el.Tags["amenity"], el.Tags["shop"], el.Tags["leisure"], el.Tags["tourism"])
+
+	var website *string
+	if w := el.Tags["website"]; w != "" {
+		website = &w
+	} else if w := el.Tags["contact:website"]; w != "" {
+		website = &w
+	}
+
+	rawTagsJSON, _ := json.Marshal(el.Tags)
+	id := fmt.Sprintf("osm_%d", el.ID)
+	externalID := fmt.Sprintf("%d", el.ID)
+
+	_, err := db.Exec(ctx, `
+		INSERT INTO places (id, source, external_id, name, category, subcategory, address, website_url, location, latitude, longitude, raw_tags, updated_at)
+		VALUES ($1, 'osm', $2, $3, $4, $5, $6, $7, ST_MakePoint($9,$8)::geography, $8, $9, $10, now())
+		ON CONFLICT (source, external_id) DO UPDATE SET
+			name = EXCLUDED.name,
+			category = EXCLUDED.category,
+			subcategory = EXCLUDED.subcategory,
+			address = EXCLUDED.address,
+			website_url = EXCLUDED.website_url,
+			location = EXCLUDED.location,
+			latitude = EXCLUDED.latitude,
+			longitude = EXCLUDED.longitude,
+			raw_tags = EXCLUDED.raw_tags,
+			updated_at = now()
+	`, id, externalID, name, category, subcategory, address, website, el.Lat, el.Lon, string(rawTagsJSON))
+
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func queryNearbyPlacesFromDB(ctx context.Context, lat, lng float64, radius int, category, searchQuery string, limit int) ([]explorePlaceDTO, error) {
+	rows, err := db.Query(ctx, `
+		SELECT id, name, category, subcategory, address, website_url, latitude, longitude,
+		       ST_Distance(location, ST_MakePoint($2,$1)::geography) AS distance_meters
+		FROM places
+		WHERE ST_DWithin(location, ST_MakePoint($2,$1)::geography, $3)
+		  AND ($4 = 'all' OR category = $4)
+		  AND ($5 = '' OR search_vector @@ plainto_tsquery('english', $5))
+		ORDER BY distance_meters ASC
+		LIMIT $6
+	`, lat, lng, radius, category, searchQuery, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	places := make([]explorePlaceDTO, 0)
+	for rows.Next() {
+		var (
+			id, name, cat, subcat, address string
+			website                        *string
+			pLat, pLng, distance           float64
+		)
+		if err := rows.Scan(&id, &name, &cat, &subcat, &address, &website, &pLat, &pLng, &distance); err != nil {
+			continue
+		}
+
+		score := 1000.0 - distance
+		if score < 0 {
+			score = 0
+		}
+		reason := formatDistance(distance)
+
+		places = append(places, explorePlaceDTO{
+			ID: id, Name: name, Category: cat, Subcategory: subcat,
+			Latitude: pLat, Longitude: pLng, Address: address,
+			DistanceMeters: distance, ReviewCount: 0, WebsiteURL: website,
+			Score: score, Reason: &reason,
+		})
+	}
 	return places, nil
 }
 
@@ -798,6 +928,7 @@ func filterAndLimitPlaces(places []explorePlaceDTO, query string, limit int) []e
 }
 
 func nearbyPlacesHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	query := r.URL.Query()
 
 	lat, errLat := strconv.ParseFloat(query.Get("lat"), 64)
@@ -827,33 +958,64 @@ func nearbyPlacesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	searchQuery := strings.ToLower(strings.TrimSpace(query.Get("q")))
-	cacheKey := exploreCacheKey(lat, lng, radius, category)
+	cacheKey := exploreCacheKey(lat, lng, radius, category, searchQuery)
 
 	exploreCache.Lock()
 	if entry, ok := exploreCache.entries[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
 		exploreCache.Unlock()
 		resp := entry.response
 		resp.Cached = true
-		resp.Places = filterAndLimitPlaces(resp.Places, searchQuery, limit)
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 	exploreCache.Unlock()
 
-	tags, ok := exploreCategoryTags[category]
-	if !ok {
-		tags = defaultExploreTags
+	dbPlaces, dbErr := queryNearbyPlacesFromDB(ctx, lat, lng, radius, category, searchQuery, limit)
+	if dbErr != nil {
+		log.Printf("db nearby query failed: %v", dbErr)
+	}
+
+	if len(dbPlaces) > 0 {
+		response := nearbyPlacesResponse{
+			Latitude: lat, Longitude: lng, RadiusMeters: radius,
+			Category: category, Cached: false, Places: dbPlaces,
+		}
+		exploreCache.Lock()
+		exploreCache.entries[cacheKey] = exploreCacheEntry{response: response, expiresAt: time.Now().Add(exploreCacheTTL)}
+		exploreCache.Unlock()
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+
+	// Nobody has ingested this area yet. Fall back to a live OSM query
+	// so Explore still works everywhere, and lazily seed the database
+	// in the background so this area is covered from now on without
+	// blocking this user's response on the write.
+	tags := tagsForCategory(category)
+	if tags == nil {
+		tags = allCategoryTags()
 	}
 
 	overpassQuery := buildOverpassQuery(lat, lng, radius, tags)
-
-	places, err := fetchOverpassPlaces(overpassQuery, lat, lng, category)
+	elements, err := fetchOverpassElements(overpassQuery)
 	if err != nil {
-		log.Printf("overpass fetch failed: %v", err)
+		log.Printf("overpass fallback failed: %v", err)
 		writeError(w, http.StatusBadGateway, "couldn't load nearby places, please try again")
 		return
 	}
 
+	go func(els []overpassElement) {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		for _, el := range els {
+			if _, err := upsertOSMElement(bgCtx, el); err != nil {
+				log.Printf("lazy upsert failed for element %d: %v", el.ID, err)
+			}
+		}
+	}(elements)
+
+	places := elementsToPlaceDTOs(elements, lat, lng, category)
+	places = filterAndLimitPlaces(places, searchQuery, limit)
 	sort.Slice(places, func(i, j int) bool { return places[i].Score > places[j].Score })
 
 	response := nearbyPlacesResponse{
@@ -865,8 +1027,94 @@ func nearbyPlacesHandler(w http.ResponseWriter, r *http.Request) {
 	exploreCache.entries[cacheKey] = exploreCacheEntry{response: response, expiresAt: time.Now().Add(exploreCacheTTL)}
 	exploreCache.Unlock()
 
-	response.Places = filterAndLimitPlaces(response.Places, searchQuery, limit)
 	writeJSON(w, http.StatusOK, response)
+}
+
+// ---------- Pipeline 2: scheduled ingestion ----------
+
+type ingestAreaRequest struct {
+	Latitude     float64 `json:"lat"`
+	Longitude    float64 `json:"lng"`
+	RadiusMeters int     `json:"radiusMeters"`
+}
+
+type ingestRequest struct {
+	Areas []ingestAreaRequest `json:"areas"`
+}
+
+type ingestResponse struct {
+	AreasProcessed int      `json:"areasProcessed"`
+	PlacesUpserted int      `json:"placesUpserted"`
+	Errors         []string `json:"errors,omitempty"`
+}
+
+// Default seed areas used when a request doesn't specify its own.
+// Edit this list to the actual cities/localities your users are in —
+// these three are placeholders, not a recommendation. Each area costs
+// one Overpass request per sweep; the 2-second pause between areas
+// below keeps this a respectful load on the shared free server.
+var defaultSeedAreas = []ingestAreaRequest{
+	{Latitude: 28.7041, Longitude: 77.1025, RadiusMeters: 8000}, // Delhi (placeholder)
+	{Latitude: 19.0760, Longitude: 72.8777, RadiusMeters: 8000}, // Mumbai (placeholder)
+	{Latitude: 12.9716, Longitude: 77.5946, RadiusMeters: 8000}, // Bengaluru (placeholder)
+}
+
+func ingestPlacesHandler(w http.ResponseWriter, r *http.Request) {
+	adminToken := os.Getenv("INGEST_ADMIN_TOKEN")
+	if adminToken == "" || r.Header.Get("X-Admin-Token") != adminToken {
+		writeError(w, http.StatusUnauthorized, "invalid or missing admin token")
+		return
+	}
+
+	var req ingestRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	areas := req.Areas
+	if len(areas) == 0 {
+		areas = defaultSeedAreas
+	}
+
+	tags := allCategoryTags()
+	ctx := r.Context()
+	totalUpserted := 0
+	var errs []string
+
+	for i, area := range areas {
+		radius := area.RadiusMeters
+		if radius <= 0 || radius > 20000 {
+			radius = 8000
+		}
+
+		overpassQuery := buildOverpassQuery(area.Latitude, area.Longitude, radius, tags)
+		elements, err := fetchOverpassElements(overpassQuery)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("area (%.4f,%.4f): %v", area.Latitude, area.Longitude, err))
+			continue
+		}
+
+		for _, el := range elements {
+			ok, err := upsertOSMElement(ctx, el)
+			if err != nil {
+				log.Printf("upsert failed for element %d: %v", el.ID, err)
+				continue
+			}
+			if ok {
+				totalUpserted++
+			}
+		}
+
+		if i < len(areas)-1 {
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, ingestResponse{
+		AreasProcessed: len(areas),
+		PlacesUpserted: totalUpserted,
+		Errors:         errs,
+	})
 }
 
 // ---------- Main ----------
@@ -875,7 +1123,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -894,6 +1142,7 @@ func main() {
 	mux.HandleFunc("POST /rooms/{code}/vote", voteHandler)
 	mux.HandleFunc("GET /rooms/{code}/status", statusHandler)
 	mux.HandleFunc("GET /places/nearby", nearbyPlacesHandler)
+	mux.HandleFunc("POST /admin/ingest-places", ingestPlacesHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
