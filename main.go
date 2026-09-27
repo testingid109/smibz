@@ -567,14 +567,14 @@ func computeResult(ctx context.Context, options []roomOptionDTO, total int) *res
 // yet; this becomes real work only once a second data source is added).
 
 type explorePlaceDTO struct {
-	ID             string  `json:"id"`
-	Name           string  `json:"name"`
-	Category       string  `json:"category"`
-	Subcategory    string  `json:"subcategory"`
-	Latitude       float64 `json:"latitude"`
-	Longitude      float64 `json:"longitude"`
-	Address        string  `json:"address"`
-	DistanceMeters float64 `json:"distanceMeters"`
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	Category       string   `json:"category"`
+	Subcategory    string   `json:"subcategory"`
+	Latitude       float64  `json:"latitude"`
+	Longitude      float64  `json:"longitude"`
+	Address        string   `json:"address"`
+	DistanceMeters float64  `json:"distanceMeters"`
 	Rating         *float64 `json:"rating,omitempty"`
 	ReviewCount    int      `json:"reviewCount"`
 	PriceLevel     *int     `json:"priceLevel,omitempty"`
@@ -757,7 +757,16 @@ func formatDistance(meters float64) string {
 func fetchOverpassElements(query string) ([]overpassElement, error) {
 	client := &http.Client{Timeout: 25 * time.Second}
 
-	resp, err := client.PostForm("https://overpass-api.de/api/interpreter", url.Values{"data": {query}})
+	overpassURL := os.Getenv("OVERPASS_API_URL")
+	if overpassURL == "" {
+		overpassURL = "https://overpass.private.coffee/api/interpreter"
+	}
+
+	resp, err := client.PostForm(
+		overpassURL,
+		url.Values{"data": {query}},
+	)
+
 	if err != nil {
 		return nil, err
 	}
